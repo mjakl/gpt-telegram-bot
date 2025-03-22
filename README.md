@@ -1,6 +1,8 @@
 # Openrouter-GPT-Telegram-Bot
 This repository contains a Telegram bot that integrates with Openrouter.AI API to provide interactive, AI-driven responses.
 
+Slightly expanded version of the original GPT Bot to allow questions via `/q`, to make it more useful in group chats.
+
 ## Installation
 
 ### Prerequisites
