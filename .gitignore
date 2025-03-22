@@ -1,4 +1,4 @@
 /.env
 /llms/
 /config.yaml
-/logs
+/logs/*.json
