@@ -1,3 +1,4 @@
 /.env
 /llms/
 /config.yaml
+/logs
