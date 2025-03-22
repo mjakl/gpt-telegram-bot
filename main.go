@@ -12,6 +12,42 @@ import (
 	"strconv"
 )
 
+// sendMessage sends a message to the specified chat
+func sendMessage(bot *tgbotapi.BotAPI, chatID int64, text string, parseMode string) error {
+	msg := tgbotapi.NewMessage(chatID, text)
+	if parseMode != "" {
+		msg.ParseMode = parseMode
+	}
+	_, err := bot.Send(msg)
+	return err
+}
+
+// handleUserMessage processes a user message and gets a response from the AI
+func handleUserMessage(bot *tgbotapi.BotAPI, client *openai.Client, message *tgbotapi.Message, conf *config.Config, userStats *user.UsageTracker) {
+	log.Printf("Processing message from User ID: %d, Username: %s, Chat ID: %d, Message: %s",
+		message.From.ID,
+		message.From.UserName,
+		message.Chat.ID,
+		message.Text)
+		
+	if !userStats.HaveAccess(conf) {
+		log.Printf("User ID: %d has no budget access", message.From.ID)
+		err := sendMessage(bot, message.Chat.ID, lang.Translate("budget_out", conf.Lang), "")
+		if err != nil {
+			log.Println(err)
+		}
+		return
+	}
+	
+	log.Printf("Sending request to API for User ID: %d", message.From.ID)
+	responseID := api.HandleChatGPTStreamResponse(bot, client, message, conf, userStats)
+	log.Printf("Received response ID: %s for User ID: %d", responseID, message.From.ID)
+	
+	if conf.Model.Type == "openrouter" {
+		userStats.GetUsageFromApi(responseID, conf)
+	}
+}
+
 func main() {
 	err := lang.LoadTranslations("./lang/")
 	if err != nil {
@@ -50,6 +86,7 @@ func main() {
 		{Command: "reset", Description: lang.Translate("description.reset", conf.Lang)},
 		{Command: "stats", Description: lang.Translate("description.stats", conf.Lang)},
 		{Command: "stop", Description: lang.Translate("description.stop", conf.Lang)},
+		{Command: "q", Description: lang.Translate("description.q", conf.Lang)},
 	}
 	_, err = bot.Request(tgbotapi.NewSetMyCommands(commands...))
 	if err != nil {
@@ -67,33 +104,32 @@ func main() {
 			continue
 		}
 		userStats := userManager.GetUser(update.SentFrom().ID, update.SentFrom().UserName, conf)
-		//userStats.AddCost(0.0)
+		
 		if update.Message.IsCommand() {
 			switch update.Message.Command() {
 			case "start":
 				msgText := lang.Translate("commands.start", conf.Lang) + lang.Translate("commands.help", conf.Lang) + lang.Translate("commands.start_end", conf.Lang)
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, msgText)
-				msg.ParseMode = "HTML"
-				bot.Send(msg)
+				sendMessage(bot, update.Message.Chat.ID, msgText, "HTML")
+				
 			case "help":
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, lang.Translate("commands.help", conf.Lang))
-				msg.ParseMode = "HTML"
-				bot.Send(msg)
+				sendMessage(bot, update.Message.Chat.ID, lang.Translate("commands.help", conf.Lang), "HTML")
+				
 			case "reset":
 				args := update.Message.CommandArguments()
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "")
+				var msgText string
 
 				if args == "system" {
 					userStats.SystemPrompt = conf.SystemPrompt
-					msg.Text = lang.Translate("commands.reset_system", conf.Lang)
+					msgText = lang.Translate("commands.reset_system", conf.Lang)
 				} else if args != "" {
 					userStats.SystemPrompt = args
-					msg.Text = lang.Translate("commands.reset_prompt", conf.Lang) + args + "."
+					msgText = lang.Translate("commands.reset_prompt", conf.Lang) + args + "."
 				} else {
 					userStats.ClearHistory()
-					msg.Text = lang.Translate("commands.reset", conf.Lang)
+					msgText = lang.Translate("commands.reset", conf.Lang)
 				}
-				bot.Send(msg)
+				sendMessage(bot, update.Message.Chat.ID, msgText, "")
+				
 			case "stats":
 				userStats.CheckHistory(conf.MaxHistorySize, conf.MaxHistoryTime)
 				countedUsage := strconv.FormatFloat(userStats.GetCurrentCost(conf.BudgetPeriod), 'f', 6, 64)
@@ -112,38 +148,51 @@ func main() {
 						lang.Translate("commands.stats_min", conf.Lang), messagesCount)
 				}
 
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, statsMessage)
-				msg.ParseMode = "HTML"
-				bot.Send(msg)
+				sendMessage(bot, update.Message.Chat.ID, statsMessage, "HTML")
 
 			case "stop":
+				var msgText string
 				if userStats.CurrentStream != nil {
 					userStats.CurrentStream.Close()
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, lang.Translate("commands.stop", conf.Lang))
-					bot.Send(msg)
+					msgText = lang.Translate("commands.stop", conf.Lang)
 				} else {
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, lang.Translate("commands.stop_err", conf.Lang))
-					bot.Send(msg)
+					msgText = lang.Translate("commands.stop_err", conf.Lang)
 				}
+				sendMessage(bot, update.Message.Chat.ID, msgText, "")
+				
+			case "q":
+				args := update.Message.CommandArguments()
+				if args == "" {
+					sendMessage(bot, update.Message.Chat.ID, lang.Translate("commands.q_empty", conf.Lang), "")
+					continue
+				}
+				
+				// Trim quotes if present (handles both single and double quotes)
+				if len(args) >= 2 && ((args[0] == '"' && args[len(args)-1] == '"') || (args[0] == '\'' && args[len(args)-1] == '\'')) {
+					args = args[1 : len(args)-1]
+				}
+				
+				// Log the /q command usage
+				log.Printf("Question command received from User ID: %d, Username: %s, Question: %s", 
+					update.Message.From.ID, 
+					update.Message.From.UserName, 
+					args)
+				
+				go func(userStats *user.UsageTracker) {
+					// Create a new message with the command arguments
+					questionMsg := tgbotapi.Message{
+						Text: args,
+						From: update.Message.From,
+						Chat: update.Message.Chat,
+					}
+					
+					handleUserMessage(bot, client, &questionMsg, conf, userStats)
+				}(userStats)
 			}
 		} else {
 			go func(userStats *user.UsageTracker) {
-				// Handle user message
-				if userStats.HaveAccess(conf) {
-					responseID := api.HandleChatGPTStreamResponse(bot, client, update.Message, conf, userStats)
-					if conf.Model.Type == "openrouter" {
-						userStats.GetUsageFromApi(responseID, conf)
-					}
-				} else {
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, lang.Translate("budget_out", conf.Lang))
-					_, err := bot.Send(msg)
-					if err != nil {
-						log.Println(err)
-					}
-				}
-
+				handleUserMessage(bot, client, update.Message, conf, userStats)
 			}(userStats)
 		}
 	}
-
 }
